@@ -18,27 +18,26 @@ class DocumentController extends Controller
     {
         $search = trim((string) $request->query('search', ''));
 
+        
         $documents = DB::table('documents')
             ->select(
                 'relative_path',
-                'filename',
-                DB::raw('COUNT(*) AS total_pages'),
-                DB::raw(
-                    'COUNT(embedding) AS embedded_pages'
-                ),
-                DB::raw('MAX(updated_at) AS last_updated')
+                'filename'
             )
-            ->when($search !== '', function ($query) use ($search) {
-                $query->where(
-                    'filename',
-                    'ILIKE',
-                    '%' . addcslashes($search, '%_\\') . '%'
-                );
-            })
+            ->selectRaw(
+                'COUNT(DISTINCT page_number) AS total_pages'
+            )
+            ->selectRaw(
+                'COUNT(*) AS total_chunks'
+            )
+            ->selectRaw(
+                'COUNT(embedding) AS embedded_chunks'
+            )
+            ->where('filename', 'ILIKE', '%' . $search . '%')
             ->groupBy('relative_path', 'filename')
             ->orderBy('filename')
-            ->paginate(20)
-            ->withQueryString();
+            ->paginate(20);
+
 
             $uploads = PdfUpload::query()
                 ->latest()
