@@ -1,0 +1,6 @@
+﻿.env.docker
+documents/
+app/.env
+app/vendor/
+app/node_modules/
+app/.phpunit.cache/

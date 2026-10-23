@@ -1,0 +1,88 @@
+﻿
+services:
+  app:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+    working_dir: /var/www/html
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/var/www/html
+      - ./documents:/documents
+      - ./docker/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+    environment:
+      DB_CONNECTION: pgsql
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_DATABASE: pdfsearch
+      DB_USERNAME: pdfsearch
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env.docker}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_CLIENT: predis
+      QUEUE_CONNECTION: redis
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: pdfsearch
+      POSTGRES_USER: pdfsearch
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env.docker}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdfsearch -d pdfsearch"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+    working_dir: /var/www/html
+    command:
+      - php
+      - artisan
+      - queue:work
+      - redis
+      - --queue=default
+      - --sleep=3
+      - --tries=2
+      - --timeout=900
+    volumes:
+      - ./app:/var/www/html
+      - ./documents:/documents
+      - ./docker/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+    environment:
+      DB_CONNECTION: pgsql
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_DATABASE: pdfsearch
+      DB_USERNAME: pdfsearch
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env.docker}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_CLIENT: predis
+      QUEUE_CONNECTION: redis
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  pgdata:
