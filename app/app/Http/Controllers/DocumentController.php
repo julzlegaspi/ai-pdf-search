@@ -10,6 +10,7 @@ use Illuminate\Support\Str;
 use App\Jobs\ProcessUploadedPdf;
 use App\Models\PdfUpload;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\File;
 
 class DocumentController extends Controller
 {
@@ -109,6 +110,85 @@ class DocumentController extends Controller
         return response()->json([
             'uploads' => $uploads,
         ]);
+    }
+
+    
+    public function destroy(PdfUpload $upload): RedirectResponse
+    {
+        if (in_array($upload->status, ['queued', 'processing'], true)) {
+            return back()->withErrors([
+                'document' => 'Cannot delete a PDF while processing.',
+            ]);
+        }
+
+        $filename = $upload->stored_filename;
+
+        if (! preg_match(
+            '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.pdf$/i',
+            $filename
+        )) {
+            return back()->withErrors([
+                'document' => 'Invalid PDF filename.',
+            ]);
+        }
+
+        $path = '/documents/' . $filename;
+
+        // Delete the physical file first.
+        if (is_file($path) && ! unlink($path)) {
+            return back()->withErrors([
+                'document' => 'Unable to delete the physical PDF file.',
+            ]);
+        }
+
+        // Delete the indexed pages and upload record.
+        DB::transaction(function () use ($upload, $filename) {
+            DB::table('documents')
+                ->where('relative_path', $filename)
+                ->delete();
+
+            $upload->delete();
+        });
+
+        return redirect()
+            ->route('documents.index')
+            ->with('success', 'PDF deleted successfully.');
+    }
+
+
+    public function reprocess(PdfUpload $upload): RedirectResponse
+    {
+        if (in_array($upload->status, ['queued', 'processing'], true)) {
+            return back()->withErrors([
+                'document' => 'This PDF is already being processed.',
+            ]);
+        }
+
+        $filename = $upload->stored_filename;
+
+        if (! preg_match(
+            '/^[0-9a-f-]{36}\.pdf$/i',
+            $filename
+        ) || ! is_file('/documents/' . $filename)) {
+            return back()->withErrors([
+                'document' => 'The PDF file is missing or invalid.',
+            ]);
+        }
+
+        $upload->update([
+            'status' => 'queued',
+            'total_pages' => 0,
+            'embedded_pages' => 0,
+            'error_message' => null,
+            'started_at' => null,
+            'completed_at' => null,
+        ]);
+
+        ProcessUploadedPdf::dispatch($upload->id);
+
+        return redirect()
+            ->route('documents.index')
+            ->with('success', 'PDF reprocessing has been queued.');
     }
 
 

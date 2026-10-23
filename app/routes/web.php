@@ -18,3 +18,9 @@ Route::post('/documents/upload', [DocumentController::class, 'upload'])
 
 Route::get('/documents/statuses', [DocumentController::class, 'statuses'])
     ->name('documents.statuses');
+
+Route::delete('/documents/uploads/{upload}', [DocumentController::class, 'destroy'])
+    ->name('documents.destroy');
+
+Route::post('/documents/uploads/{upload}/reprocess', [DocumentController::class, 'reprocess'])
+    ->name('documents.reprocess');

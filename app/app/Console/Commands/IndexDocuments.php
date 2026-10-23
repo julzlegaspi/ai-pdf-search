@@ -3,35 +3,36 @@
 namespace App\Console\Commands;
 
 use App\Models\Document;
+use App\Services\TextChunker;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
+use RuntimeException;
 use Smalot\PdfParser\Parser;
 use Symfony\Component\Process\Process;
 use Throwable;
-use RuntimeException;
 
 class IndexDocuments extends Command
 {
     protected $signature = 'documents:index
-                        {--file= : Relative path of one PDF to index}';
+        {--file= : UUID filename of one uploaded PDF}
+        {--force : Reindex even if the PDF has not changed}';
 
     protected $description =
-        'Index PDFs and OCR pages that contain little or no text';
+        'Index PDFs as text chunks, using OCR for scanned pages';
 
     public function handle(): int
     {
-        
+        $root = realpath('/documents');
+
+        if ($root === false || ! is_dir($root)) {
+            $this->error('Documents directory not found.');
+            return self::FAILURE;
+        }
+
         $fileOption = $this->option('file');
+        $force = (bool) $this->option('force');
 
         if ($fileOption !== null && $fileOption !== '') {
-            $root = realpath('/documents');
-
-            if ($root === false) {
-                $this->error('Documents directory not found.');
-                return self::FAILURE;
-            }
-
-            // Uploaded files use UUID filenames, not arbitrary paths.
             if (! preg_match(
                 '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.pdf$/i',
                 $fileOption
@@ -40,52 +41,72 @@ class IndexDocuments extends Command
                 return self::FAILURE;
             }
 
-            $target = realpath($root . DIRECTORY_SEPARATOR . $fileOption);
+            $target = realpath(
+                $root . DIRECTORY_SEPARATOR . $fileOption
+            );
 
-            if ($target === false ||
-                ! str_starts_with($target, $root . DIRECTORY_SEPARATOR) ||
-                ! is_file($target)) {
+            if (
+                $target === false ||
+                ! str_starts_with(
+                    $target,
+                    $root . DIRECTORY_SEPARATOR
+                ) ||
+                ! is_file($target)
+            ) {
                 $this->error('PDF file not found.');
                 return self::FAILURE;
             }
 
+            $files = [new \SplFileInfo($target)];
+
             $this->info("Indexing only: {$fileOption}");
-
-            // Use $target as the only PDF to process.
-        }
-
-
-        $root = '/documents';
-
-        if (! is_dir($root)) {
-            $this->error("Directory not found: {$root}");
-
-            return self::FAILURE;
+        } else {
+            $files = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator(
+                    $root,
+                    \FilesystemIterator::SKIP_DOTS
+                )
+            );
         }
 
         $parser = new Parser();
-        $count = 0;
+        $chunker = new TextChunker();
+
+        $indexedFiles = 0;
+        $indexedChunks = 0;
         $errors = 0;
 
-        $files = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator(
-                $root,
-                \FilesystemIterator::SKIP_DOTS
-            )
-        );
-
         foreach ($files as $file) {
-            if (! $file->isFile()
-                || strtolower($file->getExtension()) !== 'pdf') {
+            if (
+                ! $file->isFile() ||
+                strtolower($file->getExtension()) !== 'pdf'
+            ) {
                 continue;
             }
 
             $absolutePath = $file->getPathname();
 
+            $resolvedPath = realpath($absolutePath);
+
+            if (
+                $resolvedPath === false ||
+                ! str_starts_with(
+                    $resolvedPath,
+                    $root . DIRECTORY_SEPARATOR
+                )
+            ) {
+                $this->warn('Skipping unsafe PDF path.');
+                $errors++;
+                continue;
+            }
+
             $relativePath = str_replace(
                 '\\',
                 '/',
-                substr($absolutePath, strlen($root) + 1)
+                substr(
+                    $absolutePath,
+                    strlen($root) + 1
+                )
             );
 
             $hash = hash_file('sha256', $absolutePath);
@@ -96,12 +117,16 @@ class IndexDocuments extends Command
                 continue;
             }
 
-            $unchanged = Document::where(
+            $existing = Document::where(
                 'relative_path',
                 $relativePath
-            )->where('file_hash', $hash)->exists();
+            );
 
-            if ($unchanged) {
+            $unchanged = (clone $existing)
+                ->where('file_hash', $hash)
+                ->exists();
+
+            if ($unchanged && ! $force) {
                 $this->line("Unchanged: {$relativePath}");
                 continue;
             }
@@ -110,45 +135,78 @@ class IndexDocuments extends Command
                 $pdf = $parser->parseFile($absolutePath);
                 $pages = $pdf->getPages();
 
+                $records = [];
+
+                foreach ($pages as $index => $page) {
+                    $pageNumber = $index + 1;
+                    $content = trim($page->getText());
+
+                    if (mb_strlen($content) < 20) {
+                        $ocrText = $this->ocrPage(
+                            $absolutePath,
+                            $pageNumber
+                        );
+
+                        if ($ocrText !== '') {
+                            $content = $ocrText;
+                        }
+                    }
+
+                    $chunks = $chunker->split($content);
+
+                    if (count($chunks) === 0) {
+                        $this->warn(
+                            "No readable text on page {$pageNumber}"
+                        );
+
+                        continue;
+                    }
+
+                    foreach ($chunks as $chunkIndex => $chunk) {
+                        $records[] = [
+                            'relative_path' => $relativePath,
+                            'filename' => $file->getFilename(),
+                            'page_number' => $pageNumber,
+                            'chunk_index' => $chunkIndex,
+                            'content' => $chunk,
+                            'file_hash' => $hash,
+                        ];
+                    }
+
+                    $this->line(
+                        "  Page {$pageNumber}: " .
+                        count($chunks) . ' chunks'
+                    );
+                }
+
+                if (count($records) === 0) {
+                    throw new RuntimeException(
+                        'No readable text found in this PDF.'
+                    );
+                }
+
+                // Replace old pages only after extraction succeeds.
                 DB::transaction(function () use (
                     $relativePath,
-                    $file,
-                    $hash,
-                    $pages,
-                    $absolutePath
+                    $records
                 ) {
                     Document::where(
                         'relative_path',
                         $relativePath
                     )->delete();
 
-                    foreach ($pages as $index => $page) {
-                        $pageNumber = $index + 1;
-                        $content = trim($page->getText());
-
-                        // OCR pages with little extracted text.
-                        if (mb_strlen($content) < 20) {
-                            $content = $this->ocrPage(
-                                $absolutePath,
-                                $pageNumber
-                            ) ?: $content;
-                        }
-
-                        Document::create([
-                            'relative_path' => $relativePath,
-                            'filename' => $file->getFilename(),
-                            'page_number' => $pageNumber,
-                            'content' => $content,
-                            'file_hash' => $hash,
-                        ]);
+                    foreach ($records as $record) {
+                        Document::create($record);
                     }
                 });
 
-                $count++;
+                $indexedFiles++;
+                $indexedChunks += count($records);
 
                 $this->info(
                     "Indexed: {$relativePath} (" .
-                    count($pages) . ' pages)'
+                    count($pages) . ' pages, ' .
+                    count($records) . ' chunks)'
                 );
             } catch (Throwable $e) {
                 $errors++;
@@ -161,17 +219,23 @@ class IndexDocuments extends Command
         }
 
         $this->info(
-            "Finished. Files indexed: {$count}; errors: {$errors}."
+            "Finished. Files: {$indexedFiles}; " .
+            "chunks: {$indexedChunks}; errors: {$errors}."
         );
 
-        return $errors > 0 ? self::FAILURE : self::SUCCESS;
+        return $errors > 0
+            ? self::FAILURE
+            : self::SUCCESS;
     }
 
     private function ocrPage(
         string $pdfPath,
         int $pageNumber
     ): string {
-        $prefix = tempnam(sys_get_temp_dir(), 'pdfocr_');
+        $prefix = tempnam(
+            sys_get_temp_dir(),
+            'pdfocr_'
+        );
 
         if ($prefix === false) {
             throw new RuntimeException(
@@ -179,7 +243,6 @@ class IndexDocuments extends Command
             );
         }
 
-        // Poppler creates the image at PREFIX.png.
         unlink($prefix);
 
         $imagePath = $prefix . '.png';

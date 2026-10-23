@@ -12,5 +12,6 @@ class Document extends Model
         'page_number',
         'content',
         'file_hash',
+        'chunk_index',
     ];
 }
